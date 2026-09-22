@@ -8,6 +8,7 @@
 #include <Common/BitPackedStringArray.h>
 #include <Common/BitPackedUInt64Array.h>
 #include <Common/Logger.h>
+#include <Common/Arena.h>
 #include <Common/PODArray.h>
 #include <Common/HashTable/HashMap.h>
 #include <Common/logger_useful.h>
@@ -18,6 +19,7 @@
 #include <absl/container/btree_map.h>
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
+#include <base/defines.h>
 #include <base/types.h>
 #include <base/PackedStringRef.h>
 
@@ -99,9 +101,9 @@ struct MergeTreeIndexTextParams
 using PostingList = roaring::Roaring;
 using PostingListPtr = std::shared_ptr<PostingList>;
 
-/// A struct for building a posting list with optimization for infrequent tokens.
-/// Tokens with cardinality less than max_small_size are stored in a raw array allocated on the stack.
-/// It avoids allocations of Roaring Bitmap for infrequent tokens without increasing the memory usage.
+/// A struct for building a posting list with a three-tier container.
+/// Infrequent tokens stay in a stack array, mid-frequency tokens use an Arena-backed `UInt32[64]`,
+/// and only tokens that exceed `max_medium_size` are promoted into a Roaring Bitmap in one shot.
 struct PostingListBuilder
 {
 public:
@@ -110,47 +112,89 @@ public:
     /// sizeof(PostingListWithContext) == 24 bytes.
     /// Use small container of the same size to reuse this memory.
     static constexpr size_t max_small_size = 6;
+    static constexpr size_t max_medium_size = 64;
     using SmallContainer = std::array<UInt32, max_small_size>;
 
-    PostingListBuilder() : small_size(0) {}
+    PostingListBuilder() : small_size(0), kind(Kind::Small) {}
     explicit PostingListBuilder(PostingList * posting_list);
 
-    /// Adds a value to small array or to the large Roaring Bitmap.
-    /// If small array is converted to Roaring Bitmap after adding a value,
-    /// posting list is created in the postings_holder and reference to it is saved.
-    void add(UInt32 value, PostingListsHolder & postings_holder);
+    /// Adds a value to the current tier.
+    /// Small overflows into an Arena `UInt32[64]`; medium overflows into a Roaring Bitmap in `postings_holder`.
+    ALWAYS_INLINE void add(UInt32 value, PostingListsHolder & postings_holder, Arena & arena)
+    {
+        if (kind == Kind::Medium) [[likely]]
+        {
+            chassert(small_size > 0);
+            chassert(medium[small_size - 1] <= value);
+            if (medium[small_size - 1] == value)
+                return;
+
+            medium[small_size++] = value;
+
+            if (small_size == max_medium_size)
+            {
+                auto * data = medium;
+                large.postings = &postings_holder.emplace_back(max_medium_size, data);
+                large.context = roaring::BulkContext();
+                kind = Kind::Large;
+            }
+            return;
+        }
+
+        addNonMedium(value, arena);
+    }
 
     size_t size() const
     {
         chassert(!isFiltered());
-        return isSmall() ? small_size : large.postings->cardinality();
+        if (isSmall() || isMedium())
+            return small_size;
+        return large.postings->cardinality();
     }
     bool isEmpty() const { return size() == 0; }
-    bool isSmall() const { return small_size < max_small_size; }
-    bool isLarge() const { return !isSmall(); }
+    bool isSmall() const { return kind == Kind::Small; }
+    bool isMedium() const { return kind == Kind::Medium; }
+    bool isLarge() const { return kind == Kind::Large; }
 
     /// A filtered entry holds no postings; only isFiltered and clearFiltered may be called on it.
-    void markFiltered() { small_size = filtered_flag; }
-    bool isFiltered() const { return small_size == filtered_flag; }
-    void clearFiltered() { small_size = 0; }
+    void markFiltered() { kind = Kind::Filtered; }
+    bool isFiltered() const { return kind == Kind::Filtered; }
+    void clearFiltered() { small_size = 0; kind = Kind::Small; }
 
     UInt32 minimum() const
     {
         chassert(!isEmpty());
-        return isSmall() ? small[0] : large.postings->minimum();
+        if (isSmall())
+            return small[0];
+        if (isMedium())
+            return medium[0];
+        return large.postings->minimum();
     }
 
     UInt32 maximum() const
     {
         chassert(!isEmpty());
-        return isSmall() ? small[small_size - 1] : large.postings->maximum();
+        if (isSmall())
+            return small[small_size - 1];
+        if (isMedium())
+            return medium[small_size - 1];
+        return large.postings->maximum();
     }
 
-    SmallContainer & getSmall() { chassert(!isFiltered()); return small; }
-    const SmallContainer & getSmall() const { chassert(!isFiltered()); return small; }
-    PostingList & getLarge() const { chassert(!isFiltered()); return *large.postings; }
+    SmallContainer & getSmall() { chassert(isSmall()); return small; }
+    const SmallContainer & getSmall() const { chassert(isSmall()); return small; }
+    std::span<const UInt32> getMedium() const { chassert(isMedium()); return {medium, small_size}; }
+    PostingList & getLarge() const { chassert(isLarge()); return *large.postings; }
 
 private:
+    enum class Kind : UInt8
+    {
+        Small,
+        Medium,
+        Large,
+        Filtered,
+    };
+
     struct PostingListWithContext
     {
         PostingList * postings;
@@ -160,11 +204,14 @@ private:
     union
     {
         SmallContainer small{};
+        UInt32 * medium;
         PostingListWithContext large;
     };
 
-    static constexpr UInt8 filtered_flag = 0xFF;
     UInt8 small_size;
+    Kind kind;
+
+    void addNonMedium(UInt32 value, Arena & arena);
 };
 
 /// Save BulkContext to optimize consecutive insertions into the posting list.
@@ -188,6 +235,7 @@ static constexpr UInt64 MAX_CARDINALITY_FOR_EMBEDDED_POSTINGS = 6;
 
 static_assert(MAX_CARDINALITY_FOR_EMBEDDED_POSTINGS <= MAX_CARDINALITY_FOR_RAW_POSTINGS, "MAX_CARDINALITY_FOR_EMBEDDED_POSTINGS must be less or equal to MAX_CARDINALITY_FOR_RAW_POSTINGS");
 static_assert(PostingListBuilder::max_small_size <= MAX_CARDINALITY_FOR_RAW_POSTINGS, "max_small_size must be less than or equal to MAX_CARDINALITY_FOR_RAW_POSTINGS");
+static_assert(PostingListBuilder::max_small_size < PostingListBuilder::max_medium_size, "max_medium_size must be greater than max_small_size");
 
 struct PostingsSerialization
 {
@@ -522,9 +570,9 @@ struct MergeTreeIndexTextGranuleBuilder
     UInt64 num_processed_tokens = 0;
     /// Pointers to posting lists for each token.
     TokenToPostingsBuilderMap tokens_map;
-    /// Holder of posting lists. std::list is used to preserve the stability of pointers to posting lists.
+    /// Holder of large (Roaring) posting lists. std::list is used to preserve the stability of pointers to posting lists.
     std::list<PostingList> posting_lists;
-    /// Keys may be serialized into arena (see ArenaKeyHolder).
+    /// Keys may be serialized into arena (see ArenaKeyHolder). Medium posting lists are also allocated here.
     std::unique_ptr<Arena> arena;
     /// Position data for phrase query support.
     /// Only allocated when params.positions is true.

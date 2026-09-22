@@ -48,6 +48,8 @@
 #include <base/range.h>
 #include <base/types.h>
 #include <base/PackedStringRef.h>
+
+#include <cstring>
 #include <fmt/ranges.h>
 
 #include <limits>
@@ -269,6 +271,9 @@ std::span<const UInt32> PostingsSerialization::toRawPostings(const PostingListBu
 
     if (postings.isSmall())
         return std::span<const UInt32>(postings.getSmall().data(), cardinality);
+
+    if (postings.isMedium())
+        return postings.getMedium();
 
     if (cardinality > raw_postings_buffer.size())
         raw_postings_buffer.resize(cardinality);
@@ -1190,6 +1195,12 @@ TokenPostingsInfo TextIndexSerialization::serializePostings(
         PostingList posting_list(postings.size(), postings.data());
         serializeLargePostings(posting_list, info, postings_stream, params, postings_serialization);
     }
+    else if (postings.isMedium())
+    {
+        const auto medium = postings.getMedium();
+        PostingList posting_list(medium.size(), medium.data());
+        serializeLargePostings(posting_list, info, postings_stream, params, postings_serialization);
+    }
     else
     {
         chassert(postings.isLarge());
@@ -1664,38 +1675,46 @@ MergeTreeIndexTextGranuleBuilder::MergeTreeIndexTextGranuleBuilder(
 
 PostingListBuilder::PostingListBuilder(PostingList * posting_list)
     : large{posting_list, roaring::BulkContext()}
-    , small_size(max_small_size)
+    , small_size(0)
+    , kind(Kind::Large)
 {
 }
 
-void PostingListBuilder::add(UInt32 value, PostingListsHolder & postings_holder)
+void PostingListBuilder::addNonMedium(UInt32 value, Arena & arena)
 {
-    if (small_size < max_small_size)
+    switch (kind)
     {
-        if (small_size)
+        case Kind::Small:
         {
-            /// Values are added in non-descending order.
-            chassert(small[small_size - 1] <= value);
-            if (small[small_size - 1] == value)
-                return;
+            if (small_size)
+            {
+                /// Values are added in non-descending order.
+                chassert(small[small_size - 1] <= value);
+                if (small[small_size - 1] == value)
+                    return;
+            }
+
+            small[small_size++] = value;
+
+            if (small_size == max_small_size)
+            {
+                auto * data = reinterpret_cast<UInt32 *>(
+                    arena.alignedAlloc(max_medium_size * sizeof(UInt32), alignof(UInt32)));
+                std::memcpy(data, small.data(), max_small_size * sizeof(UInt32));
+                medium = data;
+                kind = Kind::Medium;
+            }
+            break;
         }
-
-        small[small_size++] = value;
-
-        if (small_size == max_small_size)
+        case Kind::Large:
         {
-            auto small_copy = std::move(small);
-            large.postings = &postings_holder.emplace_back();
-            large.context = roaring::BulkContext();
-
-            for (size_t i = 0; i < max_small_size; ++i)
-                large.postings->addBulk(large.context, small_copy[i]);
+            /// Use addBulk to optimize consecutive insertions into the posting list.
+            large.postings->addBulk(large.context, value);
+            break;
         }
-    }
-    else
-    {
-        /// Use addBulk to optimize consecutive insertions into the posting list.
-        large.postings->addBulk(large.context, value);
+        case Kind::Medium:
+        case Kind::Filtered:
+            UNREACHABLE();
     }
 }
 
@@ -1788,7 +1807,7 @@ void MergeTreeIndexTextGranuleBuilder::addToken(std::string_view token, UInt32 t
     }
 
     PostingListBuilder & posting_list_builder = it->getMapped();
-    posting_list_builder.add(static_cast<UInt32>(current_row), posting_lists);
+    posting_list_builder.add(static_cast<UInt32>(current_row), posting_lists, *arena);
 
     ++num_processed_tokens;
 }
