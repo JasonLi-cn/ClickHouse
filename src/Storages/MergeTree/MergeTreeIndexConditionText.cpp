@@ -2036,8 +2036,9 @@ bool MergeTreeIndexConditionText::traverseJSONStringValuesNode(
     if (!dag_node || !dag_node->result_type)
         return false;
 
+    const auto & root = header.getByPosition(0);
     auto haystack = tryMatchJSONStringValuesHaystack(
-        index_column_node.getColumnName(), dag_node->result_type, header.getByPosition(0).name);
+        index_column_node.getColumnName(), dag_node->result_type, root.name, root.type);
     if (!haystack)
         return false;
 

@@ -102,11 +102,14 @@ struct JSONStringValuesHaystack
 };
 
 /// Match a filter column against a bare JSON text index (`tokenizer = jsonStringValues`).
-/// `root_column_name` is the unique header column (the JSON identifier). Does not unwrap CAST
-/// and does not strip arbitrary `.:\`Type\`` suffixes.
+/// `root_column_name` is the unique header column (the JSON identifier). `root_type` is that
+/// column's `JSON` type and is used to refuse paths inside typed prefixes the indexer does not
+/// walk (`Tuple` / `Array` / `Map` / scalars). Does not unwrap CAST and does not strip arbitrary
+/// `.:\`Type\`` suffixes.
 std::optional<JSONStringValuesHaystack> tryMatchJSONStringValuesHaystack(
     std::string_view column_name,
     const DataTypePtr & result_type,
-    std::string_view root_column_name);
+    std::string_view root_column_name,
+    const DataTypePtr & root_type);
 
 }
