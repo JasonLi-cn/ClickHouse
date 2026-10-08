@@ -4,6 +4,8 @@
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/NestedUtils.h>
 #include <Storages/MergeTree/ColumnsSubstreams.h>
+#include <Storages/MergeTree/MergedColumnOnlyOutputStream.h>
+#include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/MergeTreeIndices.h>
@@ -21,6 +23,12 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+}
+
+namespace MergeTreeSetting
+{
+    extern const MergeTreeSettingsBool allow_experimental_vertical_merge_tuple_subcolumns;
+    extern const MergeTreeSettingsUInt64 enable_vertical_merge_algorithm;
 }
 
 namespace
@@ -325,8 +333,6 @@ void rerouteSkipIndexesOntoLeaves(
         skip_indexes_by_column[parent] = std::move(leftover);
 }
 
-}
-
 void tryFlattenGatheringColumns(
     NamesAndTypesList & gathering_columns,
     const NamesAndTypesList & storage_columns,
@@ -378,6 +384,89 @@ void tryFlattenGatheringColumns(
     }
 
     gathering_columns = std::move(new_gathering);
+}
+
+/// Classify the Tuple parent against the text-index work this merge will actually do,
+/// not every metadata declaration. `MergeTextIndexStage::prepare` reuses an index's
+/// existing segment files whenever every source part already has the materialized
+/// index (`getDeserializedFormat`), so the merge never reads the parent Tuple data for
+/// that index and the parent may stay flattened. A row-reducing merge always rebuilds
+/// text indexes from column data (`addBuildTextIndexesStep`), so every text index pins
+/// in that case. The full `text_indexes_to_merge` is left untouched for the merge itself.
+IndicesDescription textIndexesThisMergeRebuilds(
+    const IndicesDescription & text_indexes_to_merge,
+    bool merge_may_reduce_rows,
+    const StorageMetadataPtr & metadata_snapshot,
+    const MergeTreeSettings & settings,
+    const MergeTreeDataPartsVector & parts)
+{
+    if (merge_may_reduce_rows)
+        return text_indexes_to_merge;
+
+    IndicesDescription text_indexes_to_rebuild;
+    for (const auto & index : text_indexes_to_merge)
+    {
+        auto index_ptr = MergeTreeIndexFactory::instance().get(metadata_snapshot, index, settings);
+
+        bool any_part_lacks_index = false;
+        for (const auto & part : parts)
+        {
+            /// An empty part contributes nothing to the merged index and is skipped by
+            /// `MergeTextIndexStage::prepare`; it cannot force a rebuild on its own.
+            if (part->rows_count == 0)
+                continue;
+
+            if (!index_ptr->getDeserializedFormat(*part, index_ptr->getFileName()))
+            {
+                any_part_lacks_index = true;
+                break;
+            }
+        }
+
+        if (any_part_lacks_index)
+            text_indexes_to_rebuild.push_back(index);
+    }
+    return text_indexes_to_rebuild;
+}
+
+}
+
+void maybeFlattenGatheringColumnsForVerticalMerge(
+    const MergeTreeSettings & settings,
+    NamesAndTypesList & gathering_columns,
+    const NamesAndTypesList & storage_columns,
+    const NamesAndTypesList & virtual_columns,
+    const MergeTreeDataPartsVector & parts,
+    const std::vector<AlterConversionsPtr> & alter_conversions,
+    const std::unordered_map<String, ColumnsStatistics> & statistics_to_build_by_part,
+    bool merge_may_reduce_rows,
+    const IndicesDescription & text_indexes_to_merge,
+    const StorageMetadataPtr & metadata_snapshot,
+    std::unordered_map<String, IndicesDescription> & skip_indexes_by_column,
+    LoggerPtr log)
+{
+    if (settings[MergeTreeSetting::enable_vertical_merge_algorithm] == 0
+        || !settings[MergeTreeSetting::allow_experimental_vertical_merge_tuple_subcolumns])
+        return;
+
+    NameSet columns_with_statistics_to_rebuild;
+    for (const auto & part_stats : statistics_to_build_by_part)
+    {
+        for (const auto & stats_entry : part_stats.second)
+            columns_with_statistics_to_rebuild.insert(stats_entry.first);
+    }
+
+    tryFlattenGatheringColumns(
+        gathering_columns,
+        storage_columns,
+        virtual_columns,
+        parts,
+        alter_conversions,
+        columns_with_statistics_to_rebuild,
+        skip_indexes_by_column,
+        textIndexesThisMergeRebuilds(
+            text_indexes_to_merge, merge_may_reduce_rows, metadata_snapshot, settings, parts),
+        log);
 }
 
 void addVerticalMergeTupleSubcolumnSizes(
@@ -585,6 +674,45 @@ void VerticalMergeTupleSubcolumnsState::assertComplete() const
             ErrorCodes::LOGICAL_ERROR,
             "Flattened Tuple group {} was not committed after the Vertical stage",
             pending_parent);
+}
+
+bool finalizeVerticalGatheredColumn(
+    const NameAndTypePair & column,
+    const NameAndTypePair * next_column,
+    MergedColumnOnlyOutputStream & column_to,
+    std::shared_ptr<VerticalMergeTupleSubcolumnsState> & state,
+    MergeTreeMutableDataPartPtr & new_data_part,
+    const NamesAndTypesList & storage_columns,
+    MergeTreeDataPartChecksums & gathered_checksums,
+    ColumnsSubstreams & gathered_columns_substreams,
+    size_t gathered_rows,
+    Int32 metadata_version)
+{
+    if (column.isSubcolumn())
+    {
+        auto changed_checksums = column_to.collectChecksums(new_data_part->checksums);
+        gathered_checksums.add(std::move(changed_checksums));
+
+        if (!state)
+            state = std::make_shared<VerticalMergeTupleSubcolumnsState>();
+        state->addLeaf(column, column_to.getNewSerializationInfos(), column_to.getColumnsSubstreams());
+
+        return state->commitIfComplete(
+            next_column,
+            storage_columns,
+            new_data_part,
+            gathered_rows,
+            gathered_columns_substreams,
+            metadata_version);
+    }
+
+    auto changed_checksums = column_to.fillChecksums(new_data_part, new_data_part->checksums);
+    gathered_checksums.add(std::move(changed_checksums));
+
+    const auto & columns_substreams = column_to.getColumnsSubstreams();
+    gathered_columns_substreams = ColumnsSubstreams::merge(
+        gathered_columns_substreams, columns_substreams, new_data_part->getColumns().getNames());
+    return true;
 }
 
 }

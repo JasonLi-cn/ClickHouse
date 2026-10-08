@@ -130,7 +130,6 @@ namespace Setting
 namespace MergeTreeSetting
 {
     extern const MergeTreeSettingsBool allow_experimental_replacing_merge_with_cleanup;
-    extern const MergeTreeSettingsBool allow_experimental_vertical_merge_tuple_subcolumns;
     extern const MergeTreeSettingsBool allow_vertical_merges_from_compact_to_wide_parts;
     extern const MergeTreeSettingsMilliseconds background_task_preferred_step_execution_time_ms;
     extern const MergeTreeSettingsDeduplicateMergeProjectionMode deduplicate_merge_projection_mode;
@@ -1089,66 +1088,19 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     ctx->sum_compressed_bytes_upper_bound = global_ctx->merge_list_element_ptr->total_size_bytes_compressed;
     ctx->sum_uncompressed_bytes_upper_bound = global_ctx->merge_list_element_ptr->total_size_bytes_uncompressed;
 
-    if ((*merge_tree_settings)[MergeTreeSetting::enable_vertical_merge_algorithm] != 0
-        && (*merge_tree_settings)[MergeTreeSetting::allow_experimental_vertical_merge_tuple_subcolumns])
-    {
-        NameSet columns_with_statistics_to_rebuild;
-        for (const auto & part_stats : global_ctx->statistics_to_build_by_part)
-        {
-            for (const auto & stats_entry : part_stats.second)
-                columns_with_statistics_to_rebuild.insert(stats_entry.first);
-        }
-
-        /// Classify the Tuple parent against the text-index work this merge will actually do,
-        /// not every metadata declaration. `MergeTextIndexStage::prepare` reuses an index's
-        /// existing segment files whenever every source part already has the materialized
-        /// index (`getDeserializedFormat`), so the merge never reads the parent Tuple data for
-        /// that index and the parent may stay flattened. A row-reducing merge always rebuilds
-        /// text indexes from column data (`addBuildTextIndexesStep`), so every text index pins
-        /// in that case. The full `text_indexes_to_merge` is left untouched for the merge itself.
-        IndicesDescription text_indexes_to_rebuild;
-        if (global_ctx->merge_may_reduce_rows)
-        {
-            text_indexes_to_rebuild = global_ctx->text_indexes_to_merge;
-        }
-        else
-        {
-            for (const auto & index : global_ctx->text_indexes_to_merge)
-            {
-                auto index_ptr = MergeTreeIndexFactory::instance().get(
-                    global_ctx->metadata_snapshot, index, *global_ctx->data_settings);
-
-                bool any_part_lacks_index = false;
-                for (const auto & part : global_ctx->future_part->parts)
-                {
-                    /// An empty part contributes nothing to the merged index and is skipped by
-                    /// `MergeTextIndexStage::prepare`; it cannot force a rebuild on its own.
-                    if (part->rows_count == 0)
-                        continue;
-
-                    if (!index_ptr->getDeserializedFormat(*part, index_ptr->getFileName()))
-                    {
-                        any_part_lacks_index = true;
-                        break;
-                    }
-                }
-
-                if (any_part_lacks_index)
-                    text_indexes_to_rebuild.push_back(index);
-            }
-        }
-
-        tryFlattenGatheringColumns(
-            global_ctx->gathering_columns,
-            global_ctx->storage_columns,
-            global_ctx->virtual_columns,
-            global_ctx->future_part->parts,
-            global_ctx->alter_conversions,
-            columns_with_statistics_to_rebuild,
-            global_ctx->skip_indexes_by_column,
-            text_indexes_to_rebuild,
-            ctx->log);
-    }
+    maybeFlattenGatheringColumnsForVerticalMerge(
+        *merge_tree_settings,
+        global_ctx->gathering_columns,
+        global_ctx->storage_columns,
+        global_ctx->virtual_columns,
+        global_ctx->future_part->parts,
+        global_ctx->alter_conversions,
+        global_ctx->statistics_to_build_by_part,
+        global_ctx->merge_may_reduce_rows,
+        global_ctx->text_indexes_to_merge,
+        global_ctx->metadata_snapshot,
+        global_ctx->skip_indexes_by_column,
+        ctx->log);
 
     global_ctx->chosen_merge_algorithm = chooseMergeAlgorithm();
     global_ctx->merge_list_element_ptr->merge_algorithm.store(global_ctx->chosen_merge_algorithm, std::memory_order_relaxed);
@@ -2364,29 +2316,19 @@ void MergeTask::VerticalMergeStage::finalizeVerticalMergeForOneColumn() const
     mergeBuiltStatistics(std::move(ctx->build_statistics_transforms), global_ctx);
 
     ctx->column_to->finalizeIndexGranularity();
-
-    const bool flattened_leaf = ctx->it_name_and_type->isSubcolumn();
-    if (flattened_leaf)
-    {
-        auto changed_checksums = ctx->column_to->collectChecksums(global_ctx->new_data_part->checksums);
-        global_ctx->gathered_data.checksums.add(std::move(changed_checksums));
-
-        if (!ctx->tuple_subcolumns_state)
-            ctx->tuple_subcolumns_state = std::make_shared<VerticalMergeTupleSubcolumnsState>();
-        ctx->tuple_subcolumns_state->addLeaf(
-            *ctx->it_name_and_type,
-            ctx->column_to->getNewSerializationInfos(),
-            ctx->column_to->getColumnsSubstreams());
-    }
-    else
-    {
-        auto changed_checksums = ctx->column_to->fillChecksums(global_ctx->new_data_part, global_ctx->new_data_part->checksums);
-        global_ctx->gathered_data.checksums.add(std::move(changed_checksums));
-
-        const auto & columns_substreams = ctx->column_to->getColumnsSubstreams();
-        global_ctx->gathered_data.columns_substreams = ColumnsSubstreams::merge(
-            global_ctx->gathered_data.columns_substreams, columns_substreams, global_ctx->new_data_part->getColumns().getNames());
-    }
+    auto next = std::next(ctx->it_name_and_type);
+    const NameAndTypePair * next_column = next == global_ctx->gathering_columns.end() ? nullptr : &*next;
+    const bool increment_columns_written = finalizeVerticalGatheredColumn(
+        *ctx->it_name_and_type,
+        next_column,
+        *ctx->column_to,
+        ctx->tuple_subcolumns_state,
+        global_ctx->new_data_part,
+        global_ctx->storage_columns,
+        global_ctx->gathered_data.checksums,
+        global_ctx->gathered_data.columns_substreams,
+        global_ctx->rows_written,
+        global_ctx->metadata_snapshot->getMetadataVersion());
 
     auto cached_marks = ctx->column_to->releaseCachedMarks();
     for (auto & [name, marks] : cached_marks)
@@ -2419,21 +2361,7 @@ void MergeTask::VerticalMergeStage::finalizeVerticalMergeForOneColumn() const
     global_ctx->merge_list_element_ptr->bytes_written_uncompressed += bytes;
     global_ctx->merge_list_element_ptr->progress.store(ctx->progress_before + ctx->column_sizes->columnWeight(column_name), std::memory_order_relaxed);
 
-    if (flattened_leaf)
-    {
-        auto next = std::next(ctx->it_name_and_type);
-        const NameAndTypePair * next_column =
-            next == global_ctx->gathering_columns.end() ? nullptr : &*next;
-        if (ctx->tuple_subcolumns_state->commitIfComplete(
-                next_column,
-                global_ctx->storage_columns,
-                global_ctx->new_data_part,
-                global_ctx->rows_written,
-                global_ctx->gathered_data.columns_substreams,
-                global_ctx->metadata_snapshot->getMetadataVersion()))
-            global_ctx->merge_list_element_ptr->columns_written += 1;
-    }
-    else
+    if (increment_columns_written)
         global_ctx->merge_list_element_ptr->columns_written += 1;
 
     /// This is the external loop increment.
