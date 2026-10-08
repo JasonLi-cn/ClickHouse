@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Tags: no-parallel, no-random-merge-tree-settings, no-object-storage, no-shared-merge-tree, no-replicated-database, no-parallel-replicas
+# Tags: no-parallel, no-fasttest, no-random-merge-tree-settings, no-object-storage, no-shared-merge-tree, no-replicated-database, no-parallel-replicas
 # Tag no-parallel: uses the server-global failpoint mt_select_parts_to_mutate_no_free_threads
+# Tag no-fasttest: failpoint tests run alone and are kept out of the fast test
 #
 # no-random-merge-tree-settings: pins flatten settings and Vertical activation.
 #
