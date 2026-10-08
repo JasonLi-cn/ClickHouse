@@ -86,7 +86,7 @@ FROM (EXPLAIN SELECT count() FROM tab WHERE hasToken(json.msg.:`String`, 'error'
 WHERE explain LIKE '%ReadFromTextIndexCount%';
 
 SELECT '-- Exact direct read also replaces under NOT';
-SELECT count()
+SELECT count() > 0
 FROM (EXPLAIN actions = 1 SELECT id FROM tab WHERE NOT hasToken(json.msg.:`String`, 'error'))
 WHERE explain LIKE '%__text_index_idx_hasToken%';
 

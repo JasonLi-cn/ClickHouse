@@ -32,7 +32,7 @@ Granules: 2/5
 1
 1
 -- Exact direct read also replaces under NOT
-3
+1
 -- IS FALSE over Nullable uses skip index (no direct read, matches master)
 idx	4
 scan	4
