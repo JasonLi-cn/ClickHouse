@@ -183,9 +183,22 @@ bool anySourceOrApplicablePatchCannotReadLeaves(
             /*record_profile_events=*/ false);
         for (const auto & patch : data_patches)
         {
+            /// `getPatchesForColumns` already translated the current name through this
+            /// patch's `AlterConversions`. The readability proof must do the same: a
+            /// metadata-only `RENAME COLUMN t TO t2` leaves the patch storing `t`.
+            const auto & patch_conversions = patch.part->getAlterConversions();
+            String parent_in_patch = parent;
+            if (patch_conversions && patch_conversions->isColumnRenamed(parent))
+            {
+                parent_in_patch = patch_conversions->getColumnOldName(parent);
+            }
+
             for (const auto & leaf : leaves)
             {
-                if (!partCanReadLeafDirectly(*patch.part, leaf, parent))
+                const NameAndTypePair leaf_in_patch = parent_in_patch == parent
+                    ? leaf
+                    : NameAndTypePair(parent_in_patch, leaf.getSubcolumnName(), leaf.getTypeInStorage(), leaf.type);
+                if (!partCanReadLeafDirectly(*patch.part, leaf_in_patch, parent_in_patch))
                     return true;
             }
         }
