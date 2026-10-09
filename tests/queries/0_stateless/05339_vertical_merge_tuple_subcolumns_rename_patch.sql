@@ -48,9 +48,11 @@ WHERE database = currentDatabase()
   AND active
   AND startsWith(name, 'patch');
 
-ALTER TABLE t_tuple_rename_patch RENAME COLUMN t TO t2;
-
+-- `SYSTEM STOP MERGES` also stops mutations, so start them before `RENAME`.
+-- The rename mutation rewrites ordinary parts to `t2`; the patch keeps `t`
+-- and is applied on the subsequent `OPTIMIZE`.
 SYSTEM START MERGES t_tuple_rename_patch;
+ALTER TABLE t_tuple_rename_patch RENAME COLUMN t TO t2;
 OPTIMIZE TABLE t_tuple_rename_patch FINAL;
 SYSTEM FLUSH LOGS part_log;
 
